@@ -125,6 +125,64 @@
             text-align: right;
         }
 
+        /* Discovery */
+        .server-list-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 0;
+        }
+
+        .server-list-header label {
+            margin: 0;
+        }
+
+        .server-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            max-height: 140px;
+            overflow-y: auto;
+        }
+
+        .server-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid transparent;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s;
+        }
+
+        .server-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .server-item.selected {
+            background: rgba(126, 87, 194, 0.25);
+            border-color: var(--accent-start);
+        }
+
+        .server-name {
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .server-addr {
+            font-size: 11px;
+            opacity: 0.5;
+        }
+
+        .server-list-empty {
+            font-size: 12px;
+            opacity: 0.5;
+            text-align: center;
+            padding: 12px 0;
+        }
+
         /* Controls */
         .control-group {
             display: flex;
@@ -225,6 +283,16 @@
         <div class="server-info" id="serverInfo">Not Connected</div>
 
         <div class="control-group">
+            <div class="server-list-header">
+                <label>Servers</label>
+                <button class="btn-icon" onclick="window.refreshDiscovery()" title="Refresh">&#8635; Refresh</button>
+            </div>
+            <div id="serverList" class="server-list">
+                <div class="server-list-empty">Searching for AriaCast servers&hellip;</div>
+            </div>
+        </div>
+
+        <div class="control-group">
             <label>Volume Boost</label>
             <input type="range" min="0" max="200" value="100" id="volumeSlider" oninput="updateVolume(this.value)">
             <div style="display:flex; justify-content:space-between; font-size:11px; opacity:0.5; padding:0 4px;">
@@ -291,6 +359,60 @@
 
         function updateServerInfo(msg) {
             document.getElementById('serverInfo').innerText = msg;
+        }
+
+        // Discovery
+        let selectedServerName = null;
+
+        // Called from Go whenever the discovery list changes
+        function updateServerList(servers) {
+            const container = document.getElementById('serverList');
+            container.innerHTML = '';
+
+            if (!servers || servers.length === 0) {
+                container.innerHTML = '<div class="server-list-empty">No AriaCast servers found &mdash; try Refresh</div>';
+                return;
+            }
+
+            servers.forEach(function (server) {
+                const item = document.createElement('div');
+                item.className = 'server-item' + (server.server_name === selectedServerName ? ' selected' : '');
+                item.onclick = function () { selectDiscoveredServer(server.server_name); };
+
+                const name = document.createElement('span');
+                name.className = 'server-name';
+                name.innerText = server.server_name;
+
+                const addr = document.createElement('span');
+                addr.className = 'server-addr';
+                addr.innerText = server.ip + ':' + server.port;
+
+                item.appendChild(name);
+                item.appendChild(addr);
+                container.appendChild(item);
+            });
+        }
+
+        function selectDiscoveredServer(name) {
+            selectedServerName = name;
+            if (window.selectServer) window.selectServer(name);
+
+            document.querySelectorAll('#serverList .server-item').forEach(function (el) {
+                const nameEl = el.querySelector('.server-name');
+                el.classList.toggle('selected', !!nameEl && nameEl.innerText === name);
+            });
+        }
+
+        window.refreshDiscovery = function () {
+            selectedServerName = null;
+            if (window.refreshServers) window.refreshServers();
+        }
+
+        // Pull the current discovery snapshot once on load, in case a server
+        // was already found before this script ran (live updates via
+        // updateServerList still arrive as they happen after this).
+        if (window.getServers) {
+            window.getServers().then(updateServerList);
         }
 
          // Window Controls Sim via Go bindings

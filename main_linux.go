@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"log"
 
@@ -48,6 +49,9 @@ func main() {
 	w.Bind("startStream", func() { (&Binding{}).Start() })
 	w.Bind("stopStream", func() { (&Binding{}).Stop() })
 	w.Bind("setVolume", func(v float64) { (&Binding{}).SetVolume(v) })
+	w.Bind("refreshServers", func() { (&Binding{}).RefreshServers() })
+	w.Bind("selectServer", func(name string) { (&Binding{}).SelectServer(name) })
+	w.Bind("getServers", func() []ServerInfo { return (&Binding{}).GetServers() })
 
 	// Linux might not support borderless dragging easily in webview without more complex GTK logic
 	// So we keep standard decorations (HintNone) or use HintFixed if we want non-resizable.
@@ -57,6 +61,8 @@ func main() {
 		log.Fatal(err)
 	}
 	w.SetHtml(string(htmlContent))
+
+	go startDiscoveryLoop(context.Background())
 
 	w.Run()
 }
