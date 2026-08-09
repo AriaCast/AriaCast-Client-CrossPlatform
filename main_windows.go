@@ -49,6 +49,7 @@ void startDrag(void* wnd) {
 import "C"
 
 import (
+	"context"
 	"embed"
 	"log"
 
@@ -100,6 +101,9 @@ func main() {
 	w.Bind("appClose", func() { (&Binding{}).Close() })
 	w.Bind("appMinimize", func() { (&Binding{}).Minimize() })
 	w.Bind("startDrag", func() { (&Binding{}).StartDrag() })
+	w.Bind("refreshServers", func() { (&Binding{}).RefreshServers() })
+	w.Bind("selectServer", func(name string) { (&Binding{}).SelectServer(name) })
+	w.Bind("getServers", func() []ServerInfo { return (&Binding{}).GetServers() })
 
 	w.Dispatch(func() {
 		C.removeBorders(w.Window())
@@ -110,6 +114,8 @@ func main() {
 		log.Fatal(err)
 	}
 	w.SetHtml(string(htmlContent))
+
+	go startDiscoveryLoop(context.Background())
 
 	w.Run()
 }

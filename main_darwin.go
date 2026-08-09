@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"log"
 
@@ -43,12 +44,17 @@ func main() {
 	w.Bind("startStream", func() { (&Binding{}).Start() })
 	w.Bind("stopStream", func() { (&Binding{}).Stop() })
 	w.Bind("setVolume", func(v float64) { (&Binding{}).SetVolume(v) })
+	w.Bind("refreshServers", func() { (&Binding{}).RefreshServers() })
+	w.Bind("selectServer", func(name string) { (&Binding{}).SelectServer(name) })
+	w.Bind("getServers", func() []ServerInfo { return (&Binding{}).GetServers() })
 
 	htmlContent, err := uiFS.ReadFile("ui/index.html")
 	if err != nil {
 		log.Fatal(err)
 	}
 	w.SetHtml(string(htmlContent))
+
+	go startDiscoveryLoop(context.Background())
 
 	w.Run()
 }

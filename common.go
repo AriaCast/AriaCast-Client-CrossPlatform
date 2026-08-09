@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -56,13 +57,20 @@ func init() {
 
 // Global App State
 var (
-	w          webview.WebView
-	mu         sync.Mutex
-	statusMsg  string  = "Idle"
-	serverInfo string  = "Not Connected"
-	volume     float64 = 1.0
-	isRunning  bool
-	cancelFunc context.CancelFunc
+	w              webview.WebView
+	mu             sync.Mutex
+	statusMsg      string  = "Idle"
+	serverInfo     string  = "Not Connected"
+	volume         float64 = 1.0
+	isRunning      bool
+	cancelFunc     context.CancelFunc
+	selectedServer *ServerInfo // server explicitly picked from the discovery list; guarded by mu
+)
+
+// Discovery State
+var (
+	discoveryMu       sync.Mutex
+	discoveredServers = make(map[string]ServerInfo) // keyed by server_name, mirrors the Android client
 )
 
 type Binding struct{}
@@ -101,6 +109,48 @@ func (b *Binding) SetVolume(val float64) {
 	mu.Unlock()
 }
 
+// RefreshServers clears the discovery list and any prior selection, then
+// immediately runs a fresh scan, mirroring the "Refresh" button in the
+// AriaCast Android app. Clearing the selection avoids streaming to a stale
+// address if the previously-picked server's IP has since changed.
+func (b *Binding) RefreshServers() {
+	log.Println("User requested discovery refresh")
+	mu.Lock()
+	selectedServer = nil
+	mu.Unlock()
+	discoveryMu.Lock()
+	discoveredServers = make(map[string]ServerInfo)
+	discoveryMu.Unlock()
+	setServerInfo("Not Connected")
+	pushServerList()
+	go scanOnce(context.Background())
+}
+
+// GetServers returns the currently known discovered servers; the UI calls
+// this once on load to pick up any results found before its own JS was
+// ready to receive the live pushServerList updates.
+func (b *Binding) GetServers() []ServerInfo {
+	return snapshotServers()
+}
+
+// SelectServer records the user's choice from the discovery list; it takes
+// effect the next time Start is called.
+func (b *Binding) SelectServer(name string) {
+	for _, s := range snapshotServers() {
+		if s.ServerName != name {
+			continue
+		}
+		info := s
+		mu.Lock()
+		selectedServer = &info
+		mu.Unlock()
+		log.Printf("User selected server: %s (%s:%d)", info.ServerName, info.IP, info.Port)
+		setServerInfo(fmt.Sprintf("Selected: %s (%s:%d)", info.ServerName, info.IP, info.Port))
+		return
+	}
+	log.Printf("SelectServer: unknown server name %q", name)
+}
+
 func (b *Binding) Close() {
 	if w != nil {
 		w.Terminate()
@@ -115,10 +165,11 @@ func setStatus(msg string) {
 
 	if w != nil {
 		w.Dispatch(func() {
-			// Simple escape for single quotes
-			// full json encoding would be safer but this is lightweight
-			js := fmt.Sprintf("updateStatus('%s');", msg)
-			w.Eval(js)
+			// msg can carry attacker-controlled text (e.g. a server_name from a
+			// UDP discovery reply), so it must go through json.Marshal rather
+			// than naive quoting to avoid breaking out of the JS string literal.
+			data, _ := json.Marshal(msg)
+			w.Eval(fmt.Sprintf("updateStatus(%s);", data))
 		})
 	}
 }
@@ -130,8 +181,8 @@ func setServerInfo(msg string) {
 
 	if w != nil {
 		w.Dispatch(func() {
-			js := fmt.Sprintf("updateServerInfo('%s');", msg)
-			w.Eval(js)
+			data, _ := json.Marshal(msg)
+			w.Eval(fmt.Sprintf("updateServerInfo(%s);", data))
 		})
 	}
 }
@@ -141,14 +192,15 @@ func setServerInfo(msg string) {
 // -----------------------------------------------------------------------------
 
 const (
-	DiscoveryPort     = 12888
-	DefaultServerPort = 12889
-	DiscoveryTimeout  = 2 * time.Second
-	DiscoveryMsg      = "DISCOVER_AUDIOCAST"
-	SampleRate        = 48000
-	Channels          = 2
-	AudioFormat       = malgo.FormatS16
-	ProtocolFrameSize = 3840
+	DiscoveryPort         = 12888
+	DefaultServerPort     = 12889
+	DiscoveryMsg          = "DISCOVER_AUDIOCAST"
+	DiscoveryBurstWindow  = 3 * time.Second // matches the AriaCast Android client's UDP listen window
+	DiscoveryLoopInterval = 5 * time.Second // matches the AriaCast Android client's re-broadcast interval
+	SampleRate            = 48000
+	Channels              = 2
+	AudioFormat           = malgo.FormatS16
+	ProtocolFrameSize     = 3840
 )
 
 type ServerInfo struct {
@@ -221,23 +273,14 @@ func runAudioLoop(ctx context.Context) {
 		}
 	}()
 
-	// 1. Discovery (or manual override from ariacast_config.json)
-	var server *ServerInfo
-	if cfg := loadManualConfig(); cfg != nil {
-		log.Printf("Using manual server config: %s (%s:%d)", cfg.ServerName, cfg.IP, cfg.Port)
-		setStatus("Using configured server...")
-		server = cfg
-	} else {
-		log.Println("Scanning for server...")
-		setStatus("Scanning for server...")
-		var err error
-		server, err = discoverServer(ctx)
-		if err != nil {
-			fail("Error: " + err.Error())
-			return
-		}
-		log.Printf("Server found: %s (%s:%d)", server.ServerName, server.IP, server.Port)
+	// 1. Resolve target server: manual override > explicit UI selection > sole discovered server
+	setStatus("Resolving server...")
+	server, err := resolveServer()
+	if err != nil {
+		fail("Error: " + err.Error())
+		return
 	}
+	log.Printf("Using server: %s (%s:%d)", server.ServerName, server.IP, server.Port)
 	setServerInfo(fmt.Sprintf("%s (%s:%d)", server.ServerName, server.IP, server.Port))
 	setStatus("Server Found! Connecting...")
 	defer sendPlayingState(server, false)
@@ -386,46 +429,152 @@ func sendPlayingState(server *ServerInfo, playing bool) {
 	log.Printf("Metadata POST to %s (isPlaying=%v): %s", url, playing, resp.Status)
 }
 
-func discoverServer(ctx context.Context) (*ServerInfo, error) {
+// resolveServer picks the server to stream to, in priority order:
+//  1. an explicit manual override configured via ariacast_config.json,
+//  2. the server the user picked from the discovery list in the UI,
+//  3. the sole server currently visible in the discovery list.
+func resolveServer() (*ServerInfo, error) {
+	if cfg := loadManualConfig(); cfg != nil {
+		log.Printf("Using manual server config: %s (%s:%d)", cfg.ServerName, cfg.IP, cfg.Port)
+		return cfg, nil
+	}
+
+	mu.Lock()
+	sel := selectedServer
+	mu.Unlock()
+	if sel != nil {
+		return sel, nil
+	}
+
+	servers := snapshotServers()
+	switch len(servers) {
+	case 0:
+		return nil, fmt.Errorf("no server found - try Refresh")
+	case 1:
+		return &servers[0], nil
+	default:
+		return nil, fmt.Errorf("multiple servers found - select one")
+	}
+}
+
+// startDiscoveryLoop repeatedly broadcasts an AriaCast discovery request and
+// listens for replies, mirroring the Android client's DiscoveryManager: a
+// burst of DiscoveryBurstWindow spent listening, then DiscoveryLoopInterval
+// idle before broadcasting again. It runs for the lifetime of the app.
+func startDiscoveryLoop(ctx context.Context) {
+	for {
+		scanOnce(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(DiscoveryLoopInterval):
+		}
+	}
+}
+
+// scanOnce sends a single AriaCast discovery broadcast and collects replies
+// for DiscoveryBurstWindow, pushing each newly-seen or updated server to the
+// UI as it arrives.
+func scanOnce(ctx context.Context) {
 	pc, err := net.ListenPacket("udp4", ":0") // Bind to random port
 	if err != nil {
-		return nil, err
+		log.Printf("discovery: listen error: %v", err)
+		return
 	}
 	defer pc.Close()
 
-	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("255.255.255.255:%d", DiscoveryPort))
+	broadcastAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("255.255.255.255:%d", DiscoveryPort))
 	if err != nil {
-		return nil, err
+		log.Printf("discovery: resolve error: %v", err)
+		return
 	}
-
-	// Send discovery packet
-	if _, err := pc.WriteTo([]byte(DiscoveryMsg), addr); err != nil {
-		return nil, err
+	if _, err := pc.WriteTo([]byte(DiscoveryMsg), broadcastAddr); err != nil {
+		log.Printf("discovery: send error: %v", err)
+		return
 	}
+	log.Println("discovery: broadcast sent, listening for replies")
 
-	// Read loop
-	buf := make([]byte, 1024)
-	resultChan := make(chan *ServerInfo, 1)
-
+	stopRead := make(chan struct{})
+	defer close(stopRead)
 	go func() {
-		pc.SetReadDeadline(time.Now().Add(DiscoveryTimeout))
-		n, _, err := pc.ReadFrom(buf)
-		if err != nil {
-			return
-		}
-
-		var info ServerInfo
-		if err := json.Unmarshal(buf[:n], &info); err == nil {
-			resultChan <- &info
+		select {
+		case <-ctx.Done():
+			pc.Close() // unblocks ReadFrom below if the app is shutting down
+		case <-stopRead:
 		}
 	}()
 
-	select {
-	case info := <-resultChan:
-		return info, nil
-	case <-time.After(DiscoveryTimeout):
-		return nil, fmt.Errorf("timeout looking for server")
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	deadline := time.Now().Add(DiscoveryBurstWindow)
+	buf := make([]byte, 1024)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		pc.SetReadDeadline(time.Now().Add(remaining))
+		n, raddr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return // timeout, or socket closed because ctx was cancelled
+		}
+
+		// Only server_name and port are trusted from the payload; the
+		// sender's IP is taken from the UDP packet itself (like the Android
+		// client), since a server can't reliably know its own address.
+		var payload struct {
+			ServerName string `json:"server_name"`
+			Port       int    `json:"port"`
+		}
+		if err := json.Unmarshal(buf[:n], &payload); err != nil || payload.ServerName == "" || payload.Port == 0 {
+			continue
+		}
+
+		host, _, err := net.SplitHostPort(raddr.String())
+		if err != nil {
+			continue
+		}
+		addOrUpdateServer(ServerInfo{ServerName: payload.ServerName, IP: host, Port: payload.Port})
 	}
+}
+
+// addOrUpdateServer records a discovered server (keyed by name, like the
+// Android client) and notifies the UI only when something actually changed.
+func addOrUpdateServer(info ServerInfo) {
+	discoveryMu.Lock()
+	prev, existed := discoveredServers[info.ServerName]
+	discoveredServers[info.ServerName] = info
+	discoveryMu.Unlock()
+
+	if !existed || prev != info {
+		log.Printf("discovery: server seen: %s (%s:%d)", info.ServerName, info.IP, info.Port)
+		pushServerList()
+	}
+}
+
+// snapshotServers returns the currently known servers, sorted by name for a
+// stable UI order.
+func snapshotServers() []ServerInfo {
+	discoveryMu.Lock()
+	defer discoveryMu.Unlock()
+
+	servers := make([]ServerInfo, 0, len(discoveredServers))
+	for _, s := range discoveredServers {
+		servers = append(servers, s)
+	}
+	sort.Slice(servers, func(i, j int) bool { return servers[i].ServerName < servers[j].ServerName })
+	return servers
+}
+
+// pushServerList sends the current discovery results to the UI.
+func pushServerList() {
+	data, err := json.Marshal(snapshotServers())
+	if err != nil {
+		log.Printf("discovery: marshal error: %v", err)
+		return
+	}
+	if w == nil {
+		return
+	}
+	w.Dispatch(func() {
+		w.Eval(fmt.Sprintf("updateServerList(%s);", data))
+	})
 }
