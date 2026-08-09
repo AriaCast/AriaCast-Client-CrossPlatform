@@ -492,6 +492,7 @@ func scanOnce(ctx context.Context) {
 		log.Printf("discovery: send error: %v", err)
 		return
 	}
+	log.Println("discovery: broadcast sent, listening for replies")
 
 	stopRead := make(chan struct{})
 	defer close(stopRead)
