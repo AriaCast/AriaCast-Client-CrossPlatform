@@ -472,13 +472,61 @@ func startDiscoveryLoop(ctx context.Context) {
 	}
 }
 
-// scanOnce sends a single AriaCast discovery broadcast and collects replies
-// for DiscoveryBurstWindow, pushing each newly-seen or updated server to the
-// UI as it arrives.
+// scanOnce sends an AriaCast discovery broadcast on every broadcast-capable
+// network interface and collects replies for DiscoveryBurstWindow, pushing
+// each newly-seen or updated server to the UI as it arrives.
 func scanOnce(ctx context.Context) {
-	pc, err := net.ListenPacket("udp4", ":0") // Bind to random port
+	addrs := broadcastCapableIPv4Addrs()
+	if len(addrs) == 0 {
+		log.Println("discovery: no broadcast-capable interface found, falling back to wildcard bind")
+		scanFromLocalAddr(ctx, nil)
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, addr := range addrs {
+		wg.Add(1)
+		go func(ip net.IP) {
+			defer wg.Done()
+			scanFromLocalAddr(ctx, ip)
+		}(addr)
+	}
+	wg.Wait()
+}
+
+func broadcastCapableIPv4Addrs() []net.IP {
+	ifaces, err := net.Interfaces()
 	if err != nil {
-		log.Printf("discovery: listen error: %v", err)
+		log.Printf("discovery: interface enumeration error: %v", err)
+		return nil
+	}
+
+	var addrs []net.IP
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagBroadcast == 0 {
+			continue
+		}
+		ifaceAddrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range ifaceAddrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if ip4 := ipNet.IP.To4(); ip4 != nil {
+				addrs = append(addrs, ip4)
+			}
+		}
+	}
+	return addrs
+}
+
+func scanFromLocalAddr(ctx context.Context, localIP net.IP) {
+	pc, err := net.ListenPacket("udp4", (&net.UDPAddr{IP: localIP, Port: 0}).String())
+	if err != nil {
+		log.Printf("discovery: listen error on %v: %v", localIP, err)
 		return
 	}
 	defer pc.Close()
@@ -489,10 +537,10 @@ func scanOnce(ctx context.Context) {
 		return
 	}
 	if _, err := pc.WriteTo([]byte(DiscoveryMsg), broadcastAddr); err != nil {
-		log.Printf("discovery: send error: %v", err)
+		log.Printf("discovery: send error on %v: %v", localIP, err)
 		return
 	}
-	log.Println("discovery: broadcast sent, listening for replies")
+	log.Printf("discovery: broadcast sent from %v, listening for replies", localIP)
 
 	stopRead := make(chan struct{})
 	defer close(stopRead)
