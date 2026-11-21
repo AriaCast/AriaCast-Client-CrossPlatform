@@ -108,9 +108,20 @@
             transition: all 0.3s ease;
         }
 
+        .status-dot.connecting {
+            background: #ffca28;
+            box-shadow: 0 0 15px #ffca28;
+            animation: pulse 1s ease-in-out infinite;
+        }
+
         .status-dot.active {
             background: #00e676;
             box-shadow: 0 0 15px #00e676;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
         }
 
         .status-text {
@@ -312,7 +323,10 @@
     </div>
 
     <script>
-        let isStreaming = false;
+        // Tracks what the app is actually doing right now, driven only by
+        // status messages coming back from Go (see updateStatus below) -
+        // never set optimistically on click. One of: 'idle', 'connecting', 'active'.
+        let phase = 'idle';
 
         function updateVolume(val) {
             if (window.setVolume) {
@@ -321,39 +335,54 @@
         }
 
         function toggleStream() {
-            if (!isStreaming) {
-                // Change to Stop state
+            if (phase === 'idle') {
                 if (window.startStream) window.startStream();
-                setStreamingState(true);
             } else {
+                // Also lets the user cancel a stuck "connecting" attempt.
                 if (window.stopStream) window.stopStream();
-                setStreamingState(false);
             }
         }
 
-        function setStreamingState(active) {
-            isStreaming = active;
+        function setPhase(next) {
+            phase = next;
             const btn = document.getElementById('mainBtn');
             const dot = document.getElementById('statusDot');
-            
-            if (active) {
+
+            dot.classList.remove('active', 'connecting');
+            btn.classList.remove('stop');
+            btn.querySelector('span').innerText = "START STREAMING";
+
+            if (next === 'active') {
                 btn.classList.add('stop');
                 btn.querySelector('span').innerText = "STOP STREAMING";
                 dot.classList.add('active');
-            } else {
-                btn.classList.remove('stop');
-                btn.querySelector('span').innerText = "START STREAMING";
-                dot.classList.remove('active');
+            } else if (next === 'connecting') {
+                btn.classList.add('stop');
+                btn.querySelector('span').innerText = "STOP STREAMING";
+                dot.classList.add('connecting');
             }
         }
 
-        // Called from Go
+        // Called from Go. Classifies every status string Go can send (see
+        // setStatus calls in common.go) into one of three UI phases. Anything
+        // that isn't a known "in progress" or "active" message is treated as
+        // idle - this also covers every error variant (Connection failed,
+        // Audio/Device/Start Error, ...) without enumerating each one.
         function updateStatus(msg) {
             document.getElementById('statusText').innerText = msg;
-            if (msg.includes("Streaming Active")) {
-                setStreamingState(true);
-            } else if (msg.includes("Stopped") || msg.includes("Error") || msg.includes("Disconnected")) {
-                setStreamingState(false);
+
+            const inProgress = (
+                msg === "Connecting..." ||
+                msg === "Resolving server..." ||
+                msg === "Server Found! Connecting..."
+            );
+
+            if (msg === "Streaming Active") {
+                setPhase('active');
+            } else if (inProgress) {
+                setPhase('connecting');
+            } else {
+                setPhase('idle');
             }
         }
 
