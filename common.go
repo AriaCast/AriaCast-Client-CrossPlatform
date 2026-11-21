@@ -12,7 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gen2brain/malgo"
@@ -285,32 +287,56 @@ func runAudioLoop(ctx context.Context) {
 	setStatus("Server Found! Connecting...")
 	defer sendPlayingState(server, false)
 
-	// 2. Connect WebSocket - FIXED PATH
-	u := fmt.Sprintf("ws://%s:%d/audio", server.IP, server.Port)
-	log.Printf("Connecting to %s", u)
+	// paused is toggled by play/pause/toggle commands from the receiver on
+	// /control; while set, captured audio is dropped instead of sent.
+	var paused atomic.Bool
+	streamingStatus := func() string {
+		if paused.Load() {
+			return "Paused"
+		}
+		return "Streaming Active"
+	}
+	setPaused := func(p bool) {
+		if paused.Swap(p) == p {
+			return
+		}
+		log.Printf("Paused set to %v by receiver", p)
+		sendPlayingState(server, !p)
+		setStatus(streamingStatus())
+	}
+	handleControl := func(msg []byte) {
+		var cmd struct {
+			Action string `json:"action"`
+		}
+		if json.Unmarshal(msg, &cmd) != nil || cmd.Action == "" {
+			return
+		}
+		switch strings.ToLower(cmd.Action) {
+		case "stop":
+			(&Binding{}).Stop()
+		case "pause":
+			setPaused(true)
+		case "play":
+			setPaused(false)
+		case "toggle", "play_pause":
+			setPaused(!paused.Load())
+		default:
+			// next/previous/seek have no meaning for a live capture.
+			log.Printf("Ignoring control action %q", cmd.Action)
+		}
+	}
 
-	c, _, err := websocket.DefaultDialer.Dial(u, nil)
+	// 2. Connect /audio plus the /control and /stats side channels
+	sess, err := connectSession(server, handleControl)
 	if err != nil {
 		fail("Connection failed: " + err.Error())
 		return
 	}
-	defer c.Close()
+	defer func() { sess.close() }()
 
-	log.Println("WebSocket connected")
-
-	// The protocol's data flow has the sender also open /control (receiver ->
-	// sender playback commands) and /stats (buffer statistics). Both are
-	// best-effort: streaming still works on /audio alone if they fail.
-	base := fmt.Sprintf("ws://%s:%d", server.IP, server.Port)
-	if ctrl := dialSideChannel(base+"/control", true); ctrl != nil {
-		defer ctrl.Close()
-	}
-	if stats := dialSideChannel(base+"/stats", false); stats != nil {
-		defer stats.Close()
-	}
-
-	sendPlayingState(server, true)
-	setStatus("Streaming Active")
+	// The capture callback writes to whichever /audio connection is current;
+	// it is nil while reconnecting, and frames captured meanwhile are dropped.
+	var current atomic.Pointer[websocket.Conn]
 
 	// 3. Audio Capture Setup
 	mctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
@@ -334,6 +360,12 @@ func runAudioLoop(ctx context.Context) {
 	onRecvFrames := func(pOutputSample, pInputSamples []byte, framecount uint32) {
 		bufferMutex.Lock()
 		defer bufferMutex.Unlock()
+
+		c := current.Load()
+		if c == nil || paused.Load() {
+			frameBuffer = frameBuffer[:0]
+			return
+		}
 
 		levelCallCount++
 		if levelCallCount%30 == 0 {
@@ -385,7 +417,11 @@ func runAudioLoop(ctx context.Context) {
 					loggedWriteErr = true
 					log.Printf("WebSocket write error: %v", err)
 				}
-				// We don't return here to keep capture unless fatal
+				// Closing the connection ends its read pump, which makes the
+				// main loop below notice the drop and reconnect.
+				current.CompareAndSwap(c, nil)
+				c.Close()
+				frameBuffer = frameBuffer[:0]
 				return
 			}
 			frameBuffer = frameBuffer[ProtocolFrameSize:]
@@ -410,16 +446,120 @@ func runAudioLoop(ctx context.Context) {
 
 	log.Println("Audio device started, capturing")
 
-	// Wait until context cancelled
-	<-ctx.Done()
-	log.Println("Context cancelled, stopping audio loop")
+	// 4. Stream until the user stops; if the /audio connection drops,
+	// reconnect with backoff. Metadata is re-sent on every (re)connect and
+	// every 10s while connected, like the Android app.
+	refresh := time.NewTicker(10 * time.Second)
+	defer refresh.Stop()
+	for {
+		loggedWriteErr = false
+		current.Store(sess.audio)
+		sendPlayingState(server, !paused.Load())
+		setStatus(streamingStatus())
+
+	connected:
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Context cancelled, stopping audio loop")
+				return
+			case <-sess.dead:
+				break connected
+			case <-refresh.C:
+				sendPlayingState(server, !paused.Load())
+			}
+		}
+
+		log.Println("Audio connection lost, reconnecting")
+		current.Store(nil)
+		sess.close()
+
+		for attempt := 1; ; attempt++ {
+			setStatus(fmt.Sprintf("Reconnecting... (attempt %d)", attempt))
+			select {
+			case <-ctx.Done():
+				log.Println("Context cancelled while reconnecting")
+				return
+			case <-time.After(reconnectDelay(attempt)):
+			}
+			sess, err = connectSession(server, handleControl)
+			if err == nil {
+				break
+			}
+			log.Printf("Reconnect attempt %d failed: %v", attempt, err)
+		}
+	}
+}
+
+// reconnectDelay backs off 1s, 2s, 4s, ... capped at 10s.
+func reconnectDelay(attempt int) time.Duration {
+	d := time.Second << min(attempt-1, 4)
+	return min(d, 10*time.Second)
+}
+
+// session is one set of WebSocket connections to the receiver.
+type session struct {
+	audio *websocket.Conn
+	dead  chan struct{} // closed when the /audio connection is gone
+	close func()        // closes all connections; safe to call repeatedly
+}
+
+// connectSession opens /audio and, as in the protocol's data flow, the
+// /control (receiver -> sender playback commands) and /stats (buffer
+// statistics) side channels. The side channels are best-effort: streaming
+// still works on /audio alone if they fail.
+func connectSession(server *ServerInfo, onControl func([]byte)) (*session, error) {
+	base := fmt.Sprintf("ws://%s:%d", server.IP, server.Port)
+	log.Printf("Connecting to %s/audio", base)
+	audio, _, err := websocket.DefaultDialer.Dial(base+"/audio", nil)
+	if err != nil {
+		return nil, err
+	}
+	log.Println("WebSocket connected")
+
+	s := &session{audio: audio, dead: make(chan struct{})}
+	conns := []*websocket.Conn{audio}
+
+	// Read pump on /audio: logs the receiver's READY handshake and detects a
+	// dropped connection (gorilla/websocket only notices while reading).
+	go func() {
+		defer close(s.dead)
+		for {
+			mt, msg, err := audio.ReadMessage()
+			if err != nil {
+				log.Printf("%s/audio read loop ended: %v", base, err)
+				return
+			}
+			if mt == websocket.TextMessage {
+				log.Printf("Received from %s/audio: %s", base, msg)
+			}
+		}
+	}()
+
+	if ctrl := dialSideChannel(base+"/control", onControl); ctrl != nil {
+		conns = append(conns, ctrl)
+	}
+	if stats := dialSideChannel(base+"/stats", nil); stats != nil {
+		conns = append(conns, stats)
+	}
+
+	var once sync.Once
+	s.close = func() {
+		once.Do(func() {
+			for _, c := range conns {
+				c.Close()
+			}
+		})
+	}
+	return s, nil
 }
 
 // dialSideChannel connects an auxiliary WebSocket (/control or /stats) and
 // starts a read pump on it. gorilla/websocket only answers pings and notices
 // a closed peer while something is reading, so the pump is needed even when
-// the messages themselves are ignored. Returns nil if the dial fails.
-func dialSideChannel(u string, logMessages bool) *websocket.Conn {
+// the messages themselves are ignored. Text messages are logged and passed
+// to onText if it is non-nil. Returns nil if the dial fails.
+func dialSideChannel(u string, onText func([]byte)) *websocket.Conn {
 	log.Printf("Connecting to %s", u)
 	c, _, err := websocket.DefaultDialer.Dial(u, nil)
 	if err != nil {
@@ -434,8 +574,9 @@ func dialSideChannel(u string, logMessages bool) *websocket.Conn {
 				log.Printf("%s read loop ended: %v", u, err)
 				return
 			}
-			if logMessages && mt == websocket.TextMessage {
+			if onText != nil && mt == websocket.TextMessage {
 				log.Printf("Received from %s: %s", u, msg)
+				onText(msg)
 			}
 		}
 	}()

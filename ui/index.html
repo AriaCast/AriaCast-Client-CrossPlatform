@@ -374,10 +374,11 @@
             const inProgress = (
                 msg === "Connecting..." ||
                 msg === "Resolving server..." ||
-                msg === "Server Found! Connecting..."
+                msg === "Server Found! Connecting..." ||
+                msg.startsWith("Reconnecting")
             );
 
-            if (msg === "Streaming Active") {
+            if (msg === "Streaming Active" || msg === "Paused") {
                 setPhase('active');
             } else if (inProgress) {
                 setPhase('connecting');
