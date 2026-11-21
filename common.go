@@ -95,11 +95,11 @@ func (b *Binding) Start() {
 func (b *Binding) Stop() {
 	log.Println("User requested Stop")
 	mu.Lock()
-	defer mu.Unlock()
 	if isRunning && cancelFunc != nil {
 		cancelFunc() // Cancel context
 		isRunning = false
 	}
+	mu.Unlock() // release before setStatus, which also locks mu
 	setStatus("Stopped")
 }
 
@@ -297,6 +297,18 @@ func runAudioLoop(ctx context.Context) {
 	defer c.Close()
 
 	log.Println("WebSocket connected")
+
+	// The protocol's data flow has the sender also open /control (receiver ->
+	// sender playback commands) and /stats (buffer statistics). Both are
+	// best-effort: streaming still works on /audio alone if they fail.
+	base := fmt.Sprintf("ws://%s:%d", server.IP, server.Port)
+	if ctrl := dialSideChannel(base+"/control", true); ctrl != nil {
+		defer ctrl.Close()
+	}
+	if stats := dialSideChannel(base+"/stats", false); stats != nil {
+		defer stats.Close()
+	}
+
 	sendPlayingState(server, true)
 	setStatus("Streaming Active")
 
@@ -401,6 +413,33 @@ func runAudioLoop(ctx context.Context) {
 	// Wait until context cancelled
 	<-ctx.Done()
 	log.Println("Context cancelled, stopping audio loop")
+}
+
+// dialSideChannel connects an auxiliary WebSocket (/control or /stats) and
+// starts a read pump on it. gorilla/websocket only answers pings and notices
+// a closed peer while something is reading, so the pump is needed even when
+// the messages themselves are ignored. Returns nil if the dial fails.
+func dialSideChannel(u string, logMessages bool) *websocket.Conn {
+	log.Printf("Connecting to %s", u)
+	c, _, err := websocket.DefaultDialer.Dial(u, nil)
+	if err != nil {
+		log.Printf("%s failed (non-fatal): %v", u, err)
+		return nil
+	}
+
+	go func() {
+		for {
+			mt, msg, err := c.ReadMessage()
+			if err != nil {
+				log.Printf("%s read loop ended: %v", u, err)
+				return
+			}
+			if logMessages && mt == websocket.TextMessage {
+				log.Printf("Received from %s: %s", u, msg)
+			}
+		}
+	}()
+	return c
 }
 
 // sendPlayingState mirrors the AriaCast Android app's metadata POST
