@@ -296,7 +296,7 @@
         <div class="control-group">
             <div class="server-list-header">
                 <label>Servers</label>
-                <button class="btn-icon" onclick="window.refreshDiscovery()" title="Refresh">&#8635; Refresh</button>
+                <button class="btn-icon" onclick="window.refreshDiscovery()">&#8635;</button>
             </div>
             <div id="serverList" class="server-list">
                 <div class="server-list-empty">Searching for AriaCast servers&hellip;</div>
@@ -400,7 +400,7 @@
             container.innerHTML = '';
 
             if (!servers || servers.length === 0) {
-                container.innerHTML = '<div class="server-list-empty">No AriaCast servers found &mdash; try Refresh</div>';
+                container.innerHTML = '<div class="server-list-empty">No AriaCast servers found &mdash; try refreshing</div>';
                 return;
             }
 
