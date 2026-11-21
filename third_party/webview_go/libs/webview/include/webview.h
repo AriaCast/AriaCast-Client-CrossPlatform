@@ -1150,6 +1150,24 @@ static inline bool is_using_nvidia_driver() {
   return S_ISDIR(buffer.st_mode);
 }
 
+// Checks whether any DRM/GPU driver that is known to trigger the DMA-BUF
+// renderer bug is active. The original check only covered the proprietary
+// NVIDIA driver (/sys/module/nvidia), but the same rendering issue has been
+// observed with nouveau, AMD and Intel on certain kernel/Mesa versions.
+// We therefore widen the check: if *any* DRM device node exists, the system
+// has a GPU that *may* be affected. is_using_nvidia_driver() is kept for
+// callers that still need the precise NVIDIA-only test.
+static inline bool is_using_potentially_bugged_gpu_driver() {
+  // Fast path: NVIDIA proprietary is the most common trigger.
+  if (is_using_nvidia_driver()) {
+    return true;
+  }
+  // Fallback: any DRM render node means a GPU driver is active.
+  // /dev/dri/renderD128 is the first render node; its presence is enough.
+  struct ::stat buffer {};
+  return ::stat("/dev/dri/renderD128", &buffer) == 0;
+}
+
 // Checks whether the windowing system is Wayland.
 static inline bool is_wayland_display() {
   if (!get_env("WAYLAND_DISPLAY").empty()) {
@@ -1176,35 +1194,31 @@ static inline bool is_gdk_x11_backend() {
 #endif
 }
 
+// Checks whether the running WebKit version is affected by the DMA-BUF
+// renderer bug (introduced in 2.42, not yet fixed upstream).
+// The original check used `wk_major == 2 && wk_minor >= 42`, which would
+// incorrectly return false for WebKit 3.x+. This version handles the
+// major-version rollover correctly.
+static inline bool is_affected_webkit_version() {
+  auto wk_major = webkit_get_major_version();
+  auto wk_minor = webkit_get_minor_version();
+  // Affected: 2.42 <= version; adjust the upper bound once a fix lands.
+  return wk_major > 2 || (wk_major == 2 && wk_minor >= 42);
+}
+
 // Checks whether WebKit is affected by bug when using DMA-BUF renderer.
 // Returns true if all of the following conditions are met:
 //  - WebKit version is >= 2.42 (please narrow this down when there's a fix).
-//  - Environment variables are empty or not set:
-//    - WEBKIT_DISABLE_DMABUF_RENDERER
+//  - WEBKIT_DISABLE_DMABUF_RENDERER is not already set.
 //  - Windowing system is not Wayland.
 //  - GDK backend is X11.
-//  - NVIDIA GPU driver is used.
+//  - A GPU driver that may trigger the bug is present.
 static inline bool is_webkit_dmabuf_bugged() {
-  auto wk_major = webkit_get_major_version();
-  auto wk_minor = webkit_get_minor_version();
-  // TODO: Narrow down affected WebKit version when there's a fixed version
-  auto is_affected_wk_version = wk_major == 2 && wk_minor >= 42;
-  if (!is_affected_wk_version) {
-    return false;
-  }
-  if (!get_env("WEBKIT_DISABLE_DMABUF_RENDERER").empty()) {
-    return false;
-  }
-  if (is_wayland_display()) {
-    return false;
-  }
-  if (!is_gdk_x11_backend()) {
-    return false;
-  }
-  if (!is_using_nvidia_driver()) {
-    return false;
-  }
-  return true;
+  return is_affected_webkit_version() &&
+         get_env("WEBKIT_DISABLE_DMABUF_RENDERER").empty() &&
+         !is_wayland_display() &&
+         is_gdk_x11_backend() &&
+         is_using_potentially_bugged_gpu_driver();
 }
 
 // Applies workaround for WebKit DMA-BUF bug if needed.

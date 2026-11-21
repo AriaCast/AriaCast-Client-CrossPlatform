@@ -35,6 +35,7 @@ A modern, cross-platform client for AriaCast built with Go and Webview.
     sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev
     ```
     > Modern distros (Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch, etc.) only ship `webkit2gtk-4.1`; the older `webkit2gtk-4.0` package has been removed upstream. This project vendors a small patched copy of `webview/webview_go` under `third_party/webview_go` (wired up via a `replace` directive in `go.mod`) so it links against `webkit2gtk-4.1` instead.
+    > **Known issue / fixed by default:** on some GPU driver / X11 setups, the DMA-BUF renderer introduced in WebKitGTK 2.42 silently breaks mouse hit-testing — the UI renders fine but buttons and the slider don't react to clicks. `main_linux.go` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` before the webview is created, which falls back to the X11/WPE renderer without disabling accelerated compositing entirely. Override with `WEBKIT_DISABLE_DMABUF_RENDERER=0` if needed.
 2.  **Build**:
     ```bash
     go build -o AriaCastClient .
