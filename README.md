@@ -55,4 +55,11 @@ A modern, cross-platform client for AriaCast built with Go and Webview.
 3.  The client will automatically discover the server on the local network.
 4.  **Windows**: For best results, install **VB-Cable** and set it as your default playback device to stream system audio silently.
 
+## Logging
+
+By default the client logs to `ariacast.log` next to the executable. Set `ARIACAST_LOG` to change that:
+
+- `ARIACAST_LOG=off` - no logging
+- `ARIACAST_LOG=stderr` - log to the terminal
+- `ARIACAST_LOG=/path/to/file.log` - log to that file
 

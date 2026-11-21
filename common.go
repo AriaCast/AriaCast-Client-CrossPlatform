@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -29,11 +30,29 @@ func writeFallbackDiagnostic(msg string) {
 	os.WriteFile(p, []byte(msg+"\n"), 0644)
 }
 
+// init sets up logging. ARIACAST_LOG overrides the default log file
+// (ariacast.log next to the executable):
+//
+//	ARIACAST_LOG=off     discard all log output
+//	ARIACAST_LOG=stderr  log to stderr (useful when run from a terminal)
+//	ARIACAST_LOG=<path>  log to that file
 func init() {
 	logPath := "ariacast.log"
 	exePath, exeErr := os.Executable()
 	if exeErr == nil {
 		logPath = filepath.Join(filepath.Dir(exePath), "ariacast.log")
+	}
+
+	switch env := os.Getenv("ARIACAST_LOG"); strings.ToLower(env) {
+	case "":
+	case "off", "none", "0", "false":
+		log.SetOutput(io.Discard)
+		return
+	case "stderr":
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+		return
+	default:
+		logPath = env
 	}
 
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
