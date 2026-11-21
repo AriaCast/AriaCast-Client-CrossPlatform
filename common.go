@@ -506,12 +506,16 @@ func connectSession(server *ServerInfo, onControl func([]byte)) (*session, error
 		return nil, err
 	}
 	log.Println("WebSocket connected")
+	if err := awaitHandshake(audio); err != nil {
+		audio.Close()
+		return nil, err
+	}
 
 	s := &session{audio: audio, dead: make(chan struct{})}
 	conns := []*websocket.Conn{audio}
 
-	// Read pump on /audio: logs the receiver's READY handshake and detects a
-	// dropped connection (gorilla/websocket only notices while reading).
+	// Read pump on /audio: detects a dropped connection (gorilla/websocket
+	// only notices while reading).
 	go func() {
 		defer close(s.dead)
 		for {
@@ -542,6 +546,50 @@ func connectSession(server *ServerInfo, onControl func([]byte)) (*session, error
 		})
 	}
 	return s, nil
+}
+
+// handshakeTimeout is how long the receiver gets to send its /audio
+// handshake, as in the protocol spec (transport.md, "Handshake").
+const handshakeTimeout = 3 * time.Second
+
+// audioHandshake is the JSON text frame the receiver sends right after the
+// /audio upgrade, e.g. {"status":"READY","sample_rate":48000,...}.
+type audioHandshake struct {
+	Status     string `json:"status"`
+	Type       string `json:"type"`
+	SampleRate int    `json:"sample_rate"`
+	Channels   int    `json:"channels"`
+	FrameSize  int    `json:"frame_size"`
+}
+
+// awaitHandshake waits for the receiver's /audio handshake. Like the Android
+// sender it accepts status "READY", or type "handshake" as a
+// forward-compatible alias; anything else, or nothing within
+// handshakeTimeout, fails the connection so the caller can retry.
+func awaitHandshake(c *websocket.Conn) error {
+	c.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	defer c.SetReadDeadline(time.Time{})
+
+	mt, msg, err := c.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("no handshake from receiver: %w", err)
+	}
+	var hs audioHandshake
+	if mt != websocket.TextMessage || json.Unmarshal(msg, &hs) != nil ||
+		(hs.Status != "READY" && hs.Type != "handshake") {
+		return fmt.Errorf("unexpected handshake from receiver: %q", msg)
+	}
+	log.Printf("Handshake: %s", msg)
+
+	// The client always sends this fixed format; a receiver expecting a
+	// different one would mis-play the audio, so make that visible in the log.
+	if hs.SampleRate != 0 && hs.SampleRate != SampleRate ||
+		hs.Channels != 0 && hs.Channels != Channels ||
+		hs.FrameSize != 0 && hs.FrameSize != ProtocolFrameSize {
+		log.Printf("Warning: receiver expects %d Hz, %d ch, %d-byte frames; sending %d Hz, %d ch, %d-byte frames",
+			hs.SampleRate, hs.Channels, hs.FrameSize, SampleRate, Channels, ProtocolFrameSize)
+	}
+	return nil
 }
 
 // dialSideChannel connects an auxiliary WebSocket (/control or /stats) and
