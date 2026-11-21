@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -9,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -314,7 +312,7 @@ func runAudioLoop(ctx context.Context) {
 	log.Printf("Using server: %s (%s:%d)", server.ServerName, server.IP, server.Port)
 	setServerInfo(fmt.Sprintf("%s (%s:%d)", server.ServerName, server.IP, server.Port))
 	setStatus("Server Found! Connecting...")
-	defer sendPlayingState(server, false)
+	defer sendMetadata(server, false, nil, true)
 
 	// 2. Connect /audio plus the /control and /stats side channels
 	sess, err := connectSession(server, handleControlMessage)
@@ -437,14 +435,15 @@ func runAudioLoop(ctx context.Context) {
 	log.Println("Audio device started, capturing")
 
 	// 4. Stream until the user stops; if the /audio connection drops,
-	// reconnect with backoff. Metadata is re-sent on every (re)connect and
-	// every 10s while connected, like the Android app.
-	refresh := time.NewTicker(10 * time.Second)
-	defer refresh.Stop()
+	// reconnect with backoff. Metadata from the desktop player is sent on
+	// every (re)connect and then kept up to date once a second.
+	reporter := &metadataReporter{server: server}
+	metaTick := time.NewTicker(time.Second)
+	defer metaTick.Stop()
 	for {
 		loggedWriteErr = false
 		current.Store(sess.audio)
-		sendPlayingState(server, true)
+		reporter.report(true)
 		setStatus("Streaming Active")
 
 	connected:
@@ -455,8 +454,8 @@ func runAudioLoop(ctx context.Context) {
 				return
 			case <-sess.dead:
 				break connected
-			case <-refresh.C:
-				sendPlayingState(server, true)
+			case <-metaTick.C:
+				reporter.report(false)
 			}
 		}
 
@@ -679,32 +678,6 @@ func mediaWorker() {
 			log.Printf("Control action %q not forwarded: %v", c.action, err)
 		}
 	}
-}
-
-// sendPlayingState mirrors the AriaCast Android app's metadata POST
-// (see AudioCastService.performMetadataUpdate / TrackMetadata): the receiver
-// uses "isPlaying" to know a streaming session is actually active.
-func sendPlayingState(server *ServerInfo, playing bool) {
-	url := fmt.Sprintf("http://%s:%d/metadata", server.IP, server.Port)
-	body, _ := json.Marshal(map[string]interface{}{
-		"data": map[string]interface{}{
-			"title":      "AriaCast Desktop",
-			"artist":     nil,
-			"album":      nil,
-			"artworkUrl": nil,
-			"durationMs": nil,
-			"positionMs": nil,
-			"isPlaying":  playing,
-		},
-	})
-
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		log.Printf("Metadata POST to %s failed: %v", url, err)
-		return
-	}
-	defer resp.Body.Close()
-	log.Printf("Metadata POST to %s (isPlaying=%v): %s", url, playing, resp.Status)
 }
 
 // resolveServer picks the server to stream to, in priority order:

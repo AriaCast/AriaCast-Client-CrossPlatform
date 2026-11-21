@@ -3,9 +3,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -18,18 +20,21 @@ const (
 	mprisPrefix = "org.mpris.MediaPlayer2."
 	mprisPath   = dbus.ObjectPath("/org/mpris/MediaPlayer2")
 	mprisPlayer = "org.mpris.MediaPlayer2.Player"
+
+	// mprisTimeout bounds each D-Bus call, so a hung player can't stall the
+	// streaming loop that polls currentTrack.
+	mprisTimeout = 500 * time.Millisecond
 )
 
 // forwardMediaCommand applies a /control action to the active MPRIS player.
 // positionMs is only used by "seek".
 func forwardMediaCommand(action string, positionMs int64) error {
-	conn, err := dbus.ConnectSessionBus()
+	conn, err := dbus.SessionBus()
 	if err != nil {
 		return fmt.Errorf("session bus: %w", err)
 	}
-	defer conn.Close()
 
-	name, err := activeMPRISPlayer(conn)
+	name, _, err := activeMPRISPlayer(conn)
 	if err != nil {
 		return err
 	}
@@ -59,42 +64,107 @@ func forwardMediaCommand(action string, positionMs int64) error {
 }
 
 // activeMPRISPlayer picks the player to control: the first one currently
-// playing, else the first one paused, else any MPRIS player at all.
-func activeMPRISPlayer(conn *dbus.Conn) (string, error) {
+// playing, else the first one paused, else any MPRIS player at all. It also
+// returns that player's org.mpris.MediaPlayer2.Player properties.
+func activeMPRISPlayer(conn *dbus.Conn) (string, map[string]dbus.Variant, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), mprisTimeout)
+	defer cancel()
 	var names []string
-	if err := conn.BusObject().Call("org.freedesktop.DBus.ListNames", 0).Store(&names); err != nil {
-		return "", fmt.Errorf("list bus names: %w", err)
+	if err := conn.BusObject().CallWithContext(ctx, "org.freedesktop.DBus.ListNames", 0).Store(&names); err != nil {
+		return "", nil, fmt.Errorf("list bus names: %w", err)
 	}
 
 	var paused, other string
+	var pausedProps, otherProps map[string]dbus.Variant
 	for _, n := range names {
 		if !strings.HasPrefix(n, mprisPrefix) {
 			continue
 		}
-		v, err := conn.Object(n, mprisPath).GetProperty(mprisPlayer + ".PlaybackStatus")
+		props, err := playerProps(conn, n)
 		if err != nil {
 			continue
 		}
-		switch status, _ := v.Value().(string); status {
+		switch status, _ := props["PlaybackStatus"].Value().(string); status {
 		case "Playing":
-			return n, nil
+			return n, props, nil
 		case "Paused":
 			if paused == "" {
-				paused = n
+				paused, pausedProps = n, props
 			}
 		default:
 			if other == "" {
-				other = n
+				other, otherProps = n, props
 			}
 		}
 	}
 	if paused != "" {
-		return paused, nil
+		return paused, pausedProps, nil
 	}
 	if other != "" {
-		return other, nil
+		return other, otherProps, nil
 	}
-	return "", fmt.Errorf("no MPRIS media player found")
+	return "", nil, fmt.Errorf("no MPRIS media player found")
+}
+
+// playerProps fetches all org.mpris.MediaPlayer2.Player properties of a
+// player in one call.
+func playerProps(conn *dbus.Conn, name string) (map[string]dbus.Variant, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), mprisTimeout)
+	defer cancel()
+	var props map[string]dbus.Variant
+	err := conn.Object(name, mprisPath).
+		CallWithContext(ctx, "org.freedesktop.DBus.Properties.GetAll", 0, mprisPlayer).
+		Store(&props)
+	return props, err
+}
+
+// currentTrack reads the track of the active MPRIS player, or returns nil if
+// there is no player.
+func currentTrack() *trackInfo {
+	conn, err := dbus.SessionBus()
+	if err != nil {
+		return nil
+	}
+	_, props, err := activeMPRISPlayer(conn)
+	if err != nil {
+		return nil
+	}
+
+	t := &trackInfo{PositionMs: -1}
+	status, _ := props["PlaybackStatus"].Value().(string)
+	t.Playing = status == "Playing"
+	md, _ := props["Metadata"].Value().(map[string]dbus.Variant)
+	t.Title, _ = md["xesam:title"].Value().(string)
+	t.Album, _ = md["xesam:album"].Value().(string)
+	t.ArtURL, _ = md["mpris:artUrl"].Value().(string)
+	switch a := md["xesam:artist"].Value().(type) {
+	case []string:
+		t.Artist = strings.Join(a, ", ")
+	case string:
+		t.Artist = a
+	}
+	// MPRIS times are microseconds; players disagree on the integer type.
+	if us, ok := variantInt(md["mpris:length"]); ok && us > 0 {
+		t.DurationMs = us / 1000
+	}
+	if us, ok := variantInt(props["Position"]); ok && us >= 0 {
+		t.PositionMs = us / 1000
+	}
+	return t
+}
+
+func variantInt(v dbus.Variant) (int64, bool) {
+	switch n := v.Value().(type) {
+	case int64:
+		return n, true
+	case uint64:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case uint32:
+		return int64(n), true
+	}
+	return 0, false
 }
 
 // mprisSeek jumps to an absolute position. MPRIS SetPosition needs the
