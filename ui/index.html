@@ -378,7 +378,7 @@
                 msg.startsWith("Reconnecting")
             );
 
-            if (msg === "Streaming Active" || msg === "Paused") {
+            if (msg === "Streaming Active") {
                 setPhase('active');
             } else if (inProgress) {
                 setPhase('connecting');

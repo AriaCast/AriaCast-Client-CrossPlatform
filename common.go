@@ -287,47 +287,8 @@ func runAudioLoop(ctx context.Context) {
 	setStatus("Server Found! Connecting...")
 	defer sendPlayingState(server, false)
 
-	// paused is toggled by play/pause/toggle commands from the receiver on
-	// /control; while set, captured audio is dropped instead of sent.
-	var paused atomic.Bool
-	streamingStatus := func() string {
-		if paused.Load() {
-			return "Paused"
-		}
-		return "Streaming Active"
-	}
-	setPaused := func(p bool) {
-		if paused.Swap(p) == p {
-			return
-		}
-		log.Printf("Paused set to %v by receiver", p)
-		sendPlayingState(server, !p)
-		setStatus(streamingStatus())
-	}
-	handleControl := func(msg []byte) {
-		var cmd struct {
-			Action string `json:"action"`
-		}
-		if json.Unmarshal(msg, &cmd) != nil || cmd.Action == "" {
-			return
-		}
-		switch strings.ToLower(cmd.Action) {
-		case "stop":
-			(&Binding{}).Stop()
-		case "pause":
-			setPaused(true)
-		case "play":
-			setPaused(false)
-		case "toggle", "play_pause":
-			setPaused(!paused.Load())
-		default:
-			// next/previous/seek have no meaning for a live capture.
-			log.Printf("Ignoring control action %q", cmd.Action)
-		}
-	}
-
 	// 2. Connect /audio plus the /control and /stats side channels
-	sess, err := connectSession(server, handleControl)
+	sess, err := connectSession(server, handleControlMessage)
 	if err != nil {
 		fail("Connection failed: " + err.Error())
 		return
@@ -362,7 +323,7 @@ func runAudioLoop(ctx context.Context) {
 		defer bufferMutex.Unlock()
 
 		c := current.Load()
-		if c == nil || paused.Load() {
+		if c == nil {
 			frameBuffer = frameBuffer[:0]
 			return
 		}
@@ -454,8 +415,8 @@ func runAudioLoop(ctx context.Context) {
 	for {
 		loggedWriteErr = false
 		current.Store(sess.audio)
-		sendPlayingState(server, !paused.Load())
-		setStatus(streamingStatus())
+		sendPlayingState(server, true)
+		setStatus("Streaming Active")
 
 	connected:
 		for {
@@ -466,7 +427,7 @@ func runAudioLoop(ctx context.Context) {
 			case <-sess.dead:
 				break connected
 			case <-refresh.C:
-				sendPlayingState(server, !paused.Load())
+				sendPlayingState(server, true)
 			}
 		}
 
@@ -482,7 +443,7 @@ func runAudioLoop(ctx context.Context) {
 				return
 			case <-time.After(reconnectDelay(attempt)):
 			}
-			sess, err = connectSession(server, handleControl)
+			sess, err = connectSession(server, handleControlMessage)
 			if err == nil {
 				break
 			}
@@ -581,6 +542,66 @@ func dialSideChannel(u string, onText func([]byte)) *websocket.Conn {
 		}
 	}()
 	return c
+}
+
+// controlCommand is a receiver -> sender /control frame, e.g.
+// {"action":"seek","position_ms":12345}. Seek targets may also arrive in
+// "value", which the Python server accepts as an alias.
+type controlCommand struct {
+	Action     string `json:"action"`
+	PositionMs *int64 `json:"position_ms"`
+	Value      *int64 `json:"value"`
+}
+
+// handleControlMessage forwards the receiver's playback commands to the
+// local media player, the way the Android app forwards them to its media
+// session. The captured audio keeps streaming either way.
+func handleControlMessage(msg []byte) {
+	var cmd controlCommand
+	if err := json.Unmarshal(msg, &cmd); err != nil || cmd.Action == "" {
+		return // e.g. {"command":...,"success":true} acknowledgements
+	}
+	action := strings.ToLower(cmd.Action)
+
+	var pos int64
+	if action == "seek" {
+		switch {
+		case cmd.PositionMs != nil:
+			pos = *cmd.PositionMs
+		case cmd.Value != nil:
+			pos = *cmd.Value
+		default:
+			log.Printf("Ignoring seek without position: %s", msg)
+			return
+		}
+	}
+
+	// D-Bus calls can block briefly, so they run on a worker to keep the read
+	// pump responsive; a single worker keeps the commands in order.
+	mediaWorkerOnce.Do(func() { go mediaWorker() })
+	select {
+	case mediaCmds <- mediaCmd{action, pos}:
+	default:
+		log.Printf("Media command queue full, dropping %q", action)
+	}
+}
+
+type mediaCmd struct {
+	action     string
+	positionMs int64
+}
+
+var (
+	mediaCmds       = make(chan mediaCmd, 16)
+	mediaWorkerOnce sync.Once
+)
+
+func mediaWorker() {
+	for c := range mediaCmds {
+		if err := forwardMediaCommand(c.action, c.positionMs); err != nil {
+			log.Printf("Control action %q not forwarded: %v", c.action, err)
+		}
+	}
 }
 
 // sendPlayingState mirrors the AriaCast Android app's metadata POST
