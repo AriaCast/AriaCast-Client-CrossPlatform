@@ -63,3 +63,16 @@ By default the client logs to `ariacast.log` next to the executable. Set `ARIACA
 - `ARIACAST_LOG=stderr` - log to the terminal
 - `ARIACAST_LOG=/path/to/file.log` - log to that file
 
+## Manual server config
+
+To skip discovery and connect to a fixed server, put an `ariacast_config.json` next to the executable:
+
+```json
+{"ip": "192.168.1.10", "port": 12889, "name": "AudioCast Speaker"}
+```
+
+Set `ARIACAST_CONFIG` to change that:
+
+- `ARIACAST_CONFIG=off` - ignore the config file and always use discovery
+- `ARIACAST_CONFIG=/path/to/config.json` - read the config from that file
+

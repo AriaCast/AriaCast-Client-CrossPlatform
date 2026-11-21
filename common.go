@@ -236,7 +236,8 @@ type manualConfig struct {
 	Name string `json:"name"`
 }
 
-// loadManualConfig reads ariacast_config.json next to the executable.
+// loadManualConfig reads ariacast_config.json next to the executable, or the
+// file ARIACAST_CONFIG points to; ARIACAST_CONFIG=off skips the config.
 // Returns nil if the file is absent, invalid, or still has the placeholder IP,
 // in which case the caller should fall back to UDP discovery.
 func loadManualConfig() *ServerInfo {
@@ -244,6 +245,15 @@ func loadManualConfig() *ServerInfo {
 	exePath, exeErr := os.Executable()
 	if exeErr == nil {
 		path = filepath.Join(filepath.Dir(exePath), "ariacast_config.json")
+	}
+
+	switch env := os.Getenv("ARIACAST_CONFIG"); strings.ToLower(env) {
+	case "":
+	case "off", "none", "0", "false":
+		log.Println("Manual config disabled via ARIACAST_CONFIG, using discovery")
+		return nil
+	default:
+		path = env
 	}
 	log.Printf("Looking for manual config at: %s (executable path: %q, err: %v)", path, exePath, exeErr)
 
@@ -255,7 +265,7 @@ func loadManualConfig() *ServerInfo {
 
 	var cfg manualConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		log.Printf("Invalid ariacast_config.json: %v", err)
+		log.Printf("Invalid config %s: %v", path, err)
 		return nil
 	}
 
