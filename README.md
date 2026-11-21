@@ -6,7 +6,7 @@ A modern, cross-platform client for AriaCast built with Go and Webview.
 
 - Go 1.25+
 - **Windows**: `gcc` (MinGW-w64 via MSYS2 recommended)
-- **Linux**: `libgtk-3-dev`, `libwebkit2gtk-4.0-dev`
+- **Linux**: `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`
 - **macOS**: Xcode Command Line Tools
 
 ## Building
@@ -32,8 +32,9 @@ A modern, cross-platform client for AriaCast built with Go and Webview.
 
 1.  **Install Dependencies**:
     ```bash
-    sudo apt install libgtk-3-dev libwebkit2gtk-4.0-dev
+    sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev
     ```
+    > Modern distros (Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch, etc.) only ship `webkit2gtk-4.1`; the older `webkit2gtk-4.0` package has been removed upstream. This project vendors a small patched copy of `webview/webview_go` under `third_party/webview_go` (wired up via a `replace` directive in `go.mod`) so it links against `webkit2gtk-4.1` instead.
 2.  **Build**:
     ```bash
     go build -o AriaCastClient .
