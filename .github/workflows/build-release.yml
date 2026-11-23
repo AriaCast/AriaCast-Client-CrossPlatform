@@ -1,0 +1,114 @@
+# Compila il client desktop (Linux e Windows) sul runner dell'homelab (self-hosted, Ubuntu Server x86_64)
+# e pubblica una release: quando una pull request viene unita in main, oppure a mano
+# (Actions → Compila e rilascia → Run workflow).
+# Ogni compilazione riuscita crea la release "build-<numero>" con i pacchetti allegati.
+# Alla fine si cancellano le release (e i tag) precedenti: resta solo l'ultima.
+#
+# Windows si compila da Linux con MinGW (cross-compilazione). macOS non si può compilare da Linux
+# (servono l'SDK Apple e i suoi framework), quindi non è incluso.
+#
+# Sul runner servono, una volta sola:
+#   sudo apt install -y git build-essential pkg-config python3 libgtk-3-dev libwebkit2gtk-4.1-dev gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+# Go lo scarica il workflow la prima volta e poi lo riusa.
+name: Compila e rilascia
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # serve a creare la release e a cancellare quelle vecchie
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Per le PR solo se sono state unite, non se chiuse senza merge.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.merged }}
+    # Runner dell'homelab. La variabile del repository BUILD_RUNNER può indicare un'etichetta precisa
+    # (es. homelab) o ubuntu-latest per tornare alle macchine di GitHub.
+    runs-on: ${{ vars.BUILD_RUNNER || 'self-hosted' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Controlla i programmi necessari; se mancano prova a installarli (serve sudo senza password),
+      # altrimenti si ferma con un messaggio chiaro.
+      - name: Controlla gli strumenti di compilazione
+        run: |
+          missing=""
+          for c in gcc g++ pkg-config python3 x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++; do
+            command -v "$c" >/dev/null || missing="$missing $c"
+          done
+          pkg-config --exists gtk+-3.0 webkit2gtk-4.1 || missing="$missing libgtk-3-dev libwebkit2gtk-4.1-dev"
+          if [ -n "$missing" ]; then
+            echo "Mancano:$missing — provo a installare i pacchetti"
+            sudo -n apt-get update
+            sudo -n apt-get install -y build-essential pkg-config python3 libgtk-3-dev libwebkit2gtk-4.1-dev gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+          fi
+
+      - name: Compila per Linux
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: amd64
+        run: go build -o AriaCastClient .
+
+      # Cross-compilazione: i binari statici non richiedono le DLL di MinGW sul PC di chi li usa.
+      - name: Compila per Windows
+        env:
+          CGO_ENABLED: "1"
+          GOOS: windows
+          GOARCH: amd64
+          CC: x86_64-w64-mingw32-gcc
+          CXX: x86_64-w64-mingw32-g++
+        run: go build -tags cgo -ldflags="-H=windowsgui -extldflags=-static" -o AriaCastClient.exe .
+
+      - name: Crea i pacchetti
+        run: |
+          mkdir dist
+          chmod +x AriaCastClient
+          tar -czf dist/AriaCastClient-linux-amd64.tar.gz AriaCastClient
+          python3 -m zipfile -c dist/AriaCastClient-windows-amd64.zip AriaCastClient.exe
+
+      - name: Crea la release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          target_commitish: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          name: Build ${{ github.run_number }}
+          body: |
+            Compilazione automatica ${{ github.event.pull_request.title && format('della PR #{0}: {1}', github.event.pull_request.number, github.event.pull_request.title) || 'manuale' }}.
+            Commit: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          make_latest: true
+
+      # Solo a compilazione riuscita: così, se fallisce, l'ultima release buona resta disponibile.
+      # Con github-script (Node) e non con il comando gh, che sull'homelab non c'è.
+      - name: Cancella le release precedenti
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const current = `build-${context.runNumber}`;
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            for (const r of releases) {
+              if (!r.tag_name.startsWith('build-') || r.tag_name === current) continue;
+              core.info(`Cancello la release ${r.tag_name}`);
+              try {
+                await github.rest.repos.deleteRelease({ owner, repo, release_id: r.id });
+                await github.rest.git.deleteRef({ owner, repo, ref: `tags/${r.tag_name}` });
+              } catch (e) { core.warning(`${r.tag_name}: ${e.message}`); }
+            }
