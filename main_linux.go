@@ -2,10 +2,25 @@
 
 package main
 
+/*
+#cgo pkg-config: gtk+-3.0
+
+#include <gtk/gtk.h>
+
+static void ariacastMinimize(void* wnd) {
+    gtk_window_iconify(GTK_WINDOW(wnd));
+}
+*/
+import "C"
+
 import (
+	"bytes"
 	"context"
 	"embed"
+	"image"
+	_ "image/png"
 	"log"
+	"os"
 
 	"github.com/gen2brain/malgo"
 	webview "github.com/webview/webview_go"
@@ -28,22 +43,55 @@ func getPlatformDeviceConfig() malgo.DeviceConfig {
 	return deviceConfig
 }
 
-// Window Methods specific to Linux (No-op or different implementation as needed)
+// Window Methods specific to Linux
 func (b *Binding) Minimize() {
-	// Linux webview implementation limitations might prevent direct minimize control easily without CGO/GTK calls
+	if w != nil {
+		w.Dispatch(func() {
+			C.ariacastMinimize(w.Window())
+		})
+	}
 }
 
 func (b *Binding) StartDrag() {
-	// Linux window dragging - usually handled by Window Manager if decorated
+	// Dragging a borderless window from a custom header needs the live GDK
+	// button-press event (coordinates + timestamp) which isn't available
+	// anymore by the time this JS->Go binding call runs. Left as a no-op;
+	// the window keeps its normal WM decorations so it can still be moved
+	// by the OS title bar.
 }
 
 func main() {
+	// The DMA-BUF renderer introduced in WebKitGTK 2.42 is known to break
+	// pointer-event hit-testing on some GPU/driver/X11 combinations: the UI
+	// renders fine but clicks and slider drags are silently swallowed.
+	// WEBKIT_DISABLE_DMABUF_RENDERER=1 falls back to the X11/WPE renderer
+	// without disabling accelerated compositing entirely.
+	// apply_webkit_dmabuf_workaround() in webview.h also sets this for
+	// detected setups; we set it here unconditionally (before webview.New)
+	// so it takes effect even where the C++ heuristic might not fire.
+	// Respect a user override.
+	if _, set := os.LookupEnv("WEBKIT_DISABLE_DMABUF_RENDERER"); !set {
+		os.Setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+	}
+
 	debug := true
 	w = webview.New(debug)
 	defer w.Destroy()
 
 	w.SetTitle("AriaCast - Linux Client")
 	w.SetSize(450, 600, webview.HintNone)
+
+	// Set the window icon from the embedded PNG so it shows in the taskbar,
+	// window switcher (Alt+Tab), and the WM title bar.
+	if iconData, err := uiFS.ReadFile("ui/icon.png"); err != nil {
+		log.Printf("Could not load icon: %v", err)
+	} else if img, _, err := image.Decode(bytes.NewReader(iconData)); err != nil {
+		log.Printf("Could not decode icon: %v", err)
+	} else {
+		w.Dispatch(func() {
+			w.SetIcon(img, webview.IconKindDefault)
+		})
+	}
 
 	// Bindings
 	w.Bind("startStream", func() { (&Binding{}).Start() })
@@ -52,6 +100,9 @@ func main() {
 	w.Bind("refreshServers", func() { (&Binding{}).RefreshServers() })
 	w.Bind("selectServer", func(name string) { (&Binding{}).SelectServer(name) })
 	w.Bind("getServers", func() []ServerInfo { return (&Binding{}).GetServers() })
+	w.Bind("appMinimize", func() { (&Binding{}).Minimize() })
+	w.Bind("appClose", func() { (&Binding{}).Close() })
+	w.Bind("startDrag", func() { (&Binding{}).StartDrag() })
 
 	// Linux might not support borderless dragging easily in webview without more complex GTK logic
 	// So we keep standard decorations (HintNone) or use HintFixed if we want non-resizable.

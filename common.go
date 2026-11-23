@@ -1,18 +1,19 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gen2brain/malgo"
@@ -27,11 +28,29 @@ func writeFallbackDiagnostic(msg string) {
 	os.WriteFile(p, []byte(msg+"\n"), 0644)
 }
 
+// init sets up logging. ARIACAST_LOG overrides the default log file
+// (ariacast.log next to the executable):
+//
+//	ARIACAST_LOG=off     discard all log output
+//	ARIACAST_LOG=stderr  log to stderr (useful when run from a terminal)
+//	ARIACAST_LOG=<path>  log to that file
 func init() {
 	logPath := "ariacast.log"
 	exePath, exeErr := os.Executable()
 	if exeErr == nil {
 		logPath = filepath.Join(filepath.Dir(exePath), "ariacast.log")
+	}
+
+	switch env := os.Getenv("ARIACAST_LOG"); strings.ToLower(env) {
+	case "":
+	case "off", "none", "0", "false":
+		log.SetOutput(io.Discard)
+		return
+	case "stderr":
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+		return
+	default:
+		logPath = env
 	}
 
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -95,11 +114,11 @@ func (b *Binding) Start() {
 func (b *Binding) Stop() {
 	log.Println("User requested Stop")
 	mu.Lock()
-	defer mu.Unlock()
 	if isRunning && cancelFunc != nil {
 		cancelFunc() // Cancel context
 		isRunning = false
 	}
+	mu.Unlock() // release before setStatus, which also locks mu
 	setStatus("Stopped")
 }
 
@@ -215,7 +234,8 @@ type manualConfig struct {
 	Name string `json:"name"`
 }
 
-// loadManualConfig reads ariacast_config.json next to the executable.
+// loadManualConfig reads ariacast_config.json next to the executable, or the
+// file ARIACAST_CONFIG points to; ARIACAST_CONFIG=off skips the config.
 // Returns nil if the file is absent, invalid, or still has the placeholder IP,
 // in which case the caller should fall back to UDP discovery.
 func loadManualConfig() *ServerInfo {
@@ -223,6 +243,15 @@ func loadManualConfig() *ServerInfo {
 	exePath, exeErr := os.Executable()
 	if exeErr == nil {
 		path = filepath.Join(filepath.Dir(exePath), "ariacast_config.json")
+	}
+
+	switch env := os.Getenv("ARIACAST_CONFIG"); strings.ToLower(env) {
+	case "":
+	case "off", "none", "0", "false":
+		log.Println("Manual config disabled via ARIACAST_CONFIG, using discovery")
+		return nil
+	default:
+		path = env
 	}
 	log.Printf("Looking for manual config at: %s (executable path: %q, err: %v)", path, exePath, exeErr)
 
@@ -234,7 +263,7 @@ func loadManualConfig() *ServerInfo {
 
 	var cfg manualConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		log.Printf("Invalid ariacast_config.json: %v", err)
+		log.Printf("Invalid config %s: %v", path, err)
 		return nil
 	}
 
@@ -283,22 +312,19 @@ func runAudioLoop(ctx context.Context) {
 	log.Printf("Using server: %s (%s:%d)", server.ServerName, server.IP, server.Port)
 	setServerInfo(fmt.Sprintf("%s (%s:%d)", server.ServerName, server.IP, server.Port))
 	setStatus("Server Found! Connecting...")
-	defer sendPlayingState(server, false)
+	defer sendMetadata(server, false, nil, true)
 
-	// 2. Connect WebSocket - FIXED PATH
-	u := fmt.Sprintf("ws://%s:%d/audio", server.IP, server.Port)
-	log.Printf("Connecting to %s", u)
-
-	c, _, err := websocket.DefaultDialer.Dial(u, nil)
+	// 2. Connect /audio plus the /control and /stats side channels
+	sess, err := connectSession(server, handleControlMessage)
 	if err != nil {
 		fail("Connection failed: " + err.Error())
 		return
 	}
-	defer c.Close()
+	defer func() { sess.close() }()
 
-	log.Println("WebSocket connected")
-	sendPlayingState(server, true)
-	setStatus("Streaming Active")
+	// The capture callback writes to whichever /audio connection is current;
+	// it is nil while reconnecting, and frames captured meanwhile are dropped.
+	var current atomic.Pointer[websocket.Conn]
 
 	// 3. Audio Capture Setup
 	mctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
@@ -322,6 +348,12 @@ func runAudioLoop(ctx context.Context) {
 	onRecvFrames := func(pOutputSample, pInputSamples []byte, framecount uint32) {
 		bufferMutex.Lock()
 		defer bufferMutex.Unlock()
+
+		c := current.Load()
+		if c == nil {
+			frameBuffer = frameBuffer[:0]
+			return
+		}
 
 		levelCallCount++
 		if levelCallCount%30 == 0 {
@@ -373,7 +405,11 @@ func runAudioLoop(ctx context.Context) {
 					loggedWriteErr = true
 					log.Printf("WebSocket write error: %v", err)
 				}
-				// We don't return here to keep capture unless fatal
+				// Closing the connection ends its read pump, which makes the
+				// main loop below notice the drop and reconnect.
+				current.CompareAndSwap(c, nil)
+				c.Close()
+				frameBuffer = frameBuffer[:0]
 				return
 			}
 			frameBuffer = frameBuffer[ProtocolFrameSize:]
@@ -398,35 +434,250 @@ func runAudioLoop(ctx context.Context) {
 
 	log.Println("Audio device started, capturing")
 
-	// Wait until context cancelled
-	<-ctx.Done()
-	log.Println("Context cancelled, stopping audio loop")
+	// 4. Stream until the user stops; if the /audio connection drops,
+	// reconnect with backoff. Metadata from the desktop player is sent on
+	// every (re)connect and then kept up to date once a second.
+	reporter := &metadataReporter{server: server}
+	metaTick := time.NewTicker(time.Second)
+	defer metaTick.Stop()
+	for {
+		loggedWriteErr = false
+		current.Store(sess.audio)
+		reporter.report(true)
+		setStatus("Streaming Active")
+
+	connected:
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Context cancelled, stopping audio loop")
+				return
+			case <-sess.dead:
+				break connected
+			case <-metaTick.C:
+				reporter.report(false)
+			}
+		}
+
+		log.Println("Audio connection lost, reconnecting")
+		current.Store(nil)
+		sess.close()
+
+		for attempt := 1; ; attempt++ {
+			setStatus(fmt.Sprintf("Reconnecting... (attempt %d)", attempt))
+			select {
+			case <-ctx.Done():
+				log.Println("Context cancelled while reconnecting")
+				return
+			case <-time.After(reconnectDelay(attempt)):
+			}
+			sess, err = connectSession(server, handleControlMessage)
+			if err == nil {
+				break
+			}
+			log.Printf("Reconnect attempt %d failed: %v", attempt, err)
+		}
+	}
 }
 
-// sendPlayingState mirrors the AriaCast Android app's metadata POST
-// (see AudioCastService.performMetadataUpdate / TrackMetadata): the receiver
-// uses "isPlaying" to know a streaming session is actually active.
-func sendPlayingState(server *ServerInfo, playing bool) {
-	url := fmt.Sprintf("http://%s:%d/metadata", server.IP, server.Port)
-	body, _ := json.Marshal(map[string]interface{}{
-		"data": map[string]interface{}{
-			"title":      "AriaCast Desktop",
-			"artist":     nil,
-			"album":      nil,
-			"artworkUrl": nil,
-			"durationMs": nil,
-			"positionMs": nil,
-			"isPlaying":  playing,
-		},
-	})
+// reconnectDelay backs off 1s, 2s, 4s, ... capped at 10s.
+func reconnectDelay(attempt int) time.Duration {
+	d := time.Second << min(attempt-1, 4)
+	return min(d, 10*time.Second)
+}
 
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+// session is one set of WebSocket connections to the receiver.
+type session struct {
+	audio *websocket.Conn
+	dead  chan struct{} // closed when the /audio connection is gone
+	close func()        // closes all connections; safe to call repeatedly
+}
+
+// connectSession opens /audio and, as in the protocol's data flow, the
+// /control (receiver -> sender playback commands) and /stats (buffer
+// statistics) side channels. The side channels are best-effort: streaming
+// still works on /audio alone if they fail.
+func connectSession(server *ServerInfo, onControl func([]byte)) (*session, error) {
+	base := fmt.Sprintf("ws://%s:%d", server.IP, server.Port)
+	log.Printf("Connecting to %s/audio", base)
+	audio, _, err := websocket.DefaultDialer.Dial(base+"/audio", nil)
 	if err != nil {
-		log.Printf("Metadata POST to %s failed: %v", url, err)
-		return
+		return nil, err
 	}
-	defer resp.Body.Close()
-	log.Printf("Metadata POST to %s (isPlaying=%v): %s", url, playing, resp.Status)
+	log.Println("WebSocket connected")
+	if err := awaitHandshake(audio); err != nil {
+		audio.Close()
+		return nil, err
+	}
+
+	s := &session{audio: audio, dead: make(chan struct{})}
+	conns := []*websocket.Conn{audio}
+
+	// Read pump on /audio: detects a dropped connection (gorilla/websocket
+	// only notices while reading).
+	go func() {
+		defer close(s.dead)
+		for {
+			mt, msg, err := audio.ReadMessage()
+			if err != nil {
+				log.Printf("%s/audio read loop ended: %v", base, err)
+				return
+			}
+			if mt == websocket.TextMessage {
+				log.Printf("Received from %s/audio: %s", base, msg)
+			}
+		}
+	}()
+
+	if ctrl := dialSideChannel(base+"/control", onControl); ctrl != nil {
+		conns = append(conns, ctrl)
+	}
+	if stats := dialSideChannel(base+"/stats", nil); stats != nil {
+		conns = append(conns, stats)
+	}
+
+	var once sync.Once
+	s.close = func() {
+		once.Do(func() {
+			for _, c := range conns {
+				c.Close()
+			}
+		})
+	}
+	return s, nil
+}
+
+// handshakeTimeout is how long the receiver gets to send its /audio
+// handshake, as in the protocol spec (transport.md, "Handshake").
+const handshakeTimeout = 3 * time.Second
+
+// audioHandshake is the JSON text frame the receiver sends right after the
+// /audio upgrade, e.g. {"status":"READY","sample_rate":48000,...}.
+type audioHandshake struct {
+	Status     string `json:"status"`
+	Type       string `json:"type"`
+	SampleRate int    `json:"sample_rate"`
+	Channels   int    `json:"channels"`
+	FrameSize  int    `json:"frame_size"`
+}
+
+// awaitHandshake waits for the receiver's /audio handshake. Like the Android
+// sender it accepts status "READY", or type "handshake" as a
+// forward-compatible alias; anything else, or nothing within
+// handshakeTimeout, fails the connection so the caller can retry.
+func awaitHandshake(c *websocket.Conn) error {
+	c.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	defer c.SetReadDeadline(time.Time{})
+
+	mt, msg, err := c.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("no handshake from receiver: %w", err)
+	}
+	var hs audioHandshake
+	if mt != websocket.TextMessage || json.Unmarshal(msg, &hs) != nil ||
+		(hs.Status != "READY" && hs.Type != "handshake") {
+		return fmt.Errorf("unexpected handshake from receiver: %q", msg)
+	}
+	log.Printf("Handshake: %s", msg)
+
+	// The client always sends this fixed format; a receiver expecting a
+	// different one would mis-play the audio, so make that visible in the log.
+	if hs.SampleRate != 0 && hs.SampleRate != SampleRate ||
+		hs.Channels != 0 && hs.Channels != Channels ||
+		hs.FrameSize != 0 && hs.FrameSize != ProtocolFrameSize {
+		log.Printf("Warning: receiver expects %d Hz, %d ch, %d-byte frames; sending %d Hz, %d ch, %d-byte frames",
+			hs.SampleRate, hs.Channels, hs.FrameSize, SampleRate, Channels, ProtocolFrameSize)
+	}
+	return nil
+}
+
+// dialSideChannel connects an auxiliary WebSocket (/control or /stats) and
+// starts a read pump on it. gorilla/websocket only answers pings and notices
+// a closed peer while something is reading, so the pump is needed even when
+// the messages themselves are ignored. Text messages are logged and passed
+// to onText if it is non-nil. Returns nil if the dial fails.
+func dialSideChannel(u string, onText func([]byte)) *websocket.Conn {
+	log.Printf("Connecting to %s", u)
+	c, _, err := websocket.DefaultDialer.Dial(u, nil)
+	if err != nil {
+		log.Printf("%s failed (non-fatal): %v", u, err)
+		return nil
+	}
+
+	go func() {
+		for {
+			mt, msg, err := c.ReadMessage()
+			if err != nil {
+				log.Printf("%s read loop ended: %v", u, err)
+				return
+			}
+			if onText != nil && mt == websocket.TextMessage {
+				log.Printf("Received from %s: %s", u, msg)
+				onText(msg)
+			}
+		}
+	}()
+	return c
+}
+
+// controlCommand is a receiver -> sender /control frame, e.g.
+// {"action":"seek","position_ms":12345}. Seek targets may also arrive in
+// "value", which the Python server accepts as an alias.
+type controlCommand struct {
+	Action     string `json:"action"`
+	PositionMs *int64 `json:"position_ms"`
+	Value      *int64 `json:"value"`
+}
+
+// handleControlMessage forwards the receiver's playback commands to the
+// local media player, the way the Android app forwards them to its media
+// session. The captured audio keeps streaming either way.
+func handleControlMessage(msg []byte) {
+	var cmd controlCommand
+	if err := json.Unmarshal(msg, &cmd); err != nil || cmd.Action == "" {
+		return // e.g. {"command":...,"success":true} acknowledgements
+	}
+	action := strings.ToLower(cmd.Action)
+
+	var pos int64
+	if action == "seek" {
+		switch {
+		case cmd.PositionMs != nil:
+			pos = *cmd.PositionMs
+		case cmd.Value != nil:
+			pos = *cmd.Value
+		default:
+			log.Printf("Ignoring seek without position: %s", msg)
+			return
+		}
+	}
+
+	// D-Bus calls can block briefly, so they run on a worker to keep the read
+	// pump responsive; a single worker keeps the commands in order.
+	mediaWorkerOnce.Do(func() { go mediaWorker() })
+	select {
+	case mediaCmds <- mediaCmd{action, pos}:
+	default:
+		log.Printf("Media command queue full, dropping %q", action)
+	}
+}
+
+type mediaCmd struct {
+	action     string
+	positionMs int64
+}
+
+var (
+	mediaCmds       = make(chan mediaCmd, 16)
+	mediaWorkerOnce sync.Once
+)
+
+func mediaWorker() {
+	for c := range mediaCmds {
+		if err := forwardMediaCommand(c.action, c.positionMs); err != nil {
+			log.Printf("Control action %q not forwarded: %v", c.action, err)
+		}
+	}
 }
 
 // resolveServer picks the server to stream to, in priority order:

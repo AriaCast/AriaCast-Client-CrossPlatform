@@ -47,6 +47,9 @@ func main() {
 	w.Bind("refreshServers", func() { (&Binding{}).RefreshServers() })
 	w.Bind("selectServer", func(name string) { (&Binding{}).SelectServer(name) })
 	w.Bind("getServers", func() []ServerInfo { return (&Binding{}).GetServers() })
+	w.Bind("appMinimize", func() { (&Binding{}).Minimize() })
+	w.Bind("appClose", func() { (&Binding{}).Close() })
+	w.Bind("startDrag", func() { (&Binding{}).StartDrag() })
 
 	htmlContent, err := uiFS.ReadFile("ui/index.html")
 	if err != nil {
