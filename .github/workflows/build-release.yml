@@ -1,0 +1,143 @@
+# Compila il client desktop (Windows, Linux, macOS) e pubblica una release:
+# quando una pull request viene unita in main, oppure a mano (Actions → Compila e rilascia → Run workflow).
+# Ogni compilazione riuscita crea la release "build-<numero>" con i tre pacchetti allegati.
+# Alla fine si cancellano le release (e i tag) precedenti: resta solo l'ultima.
+name: Compila e rilascia
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # serve a creare la release e a cancellare quelle vecchie
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Per le PR solo se sono state unite, non se chiuse senza merge.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.merged }}
+    name: Compila (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: windows-amd64
+            os: windows-latest
+            goos: windows
+            goarch: amd64
+            binary: AriaCastClient.exe
+            flags: -tags cgo -ldflags=-H=windowsgui
+          - name: linux-amd64
+            os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            binary: AriaCastClient
+            flags: ""
+          - name: macos-arm64
+            os: macos-latest
+            goos: darwin
+            goarch: arm64
+            binary: AriaCastClient
+            flags: ""
+          - name: macos-amd64
+            os: macos-latest
+            goos: darwin
+            goarch: amd64
+            binary: AriaCastClient
+            flags: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Dipendenze di sistema (Linux)
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - name: Compila
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          # Su macOS la build per l'altra architettura passa da clang con -arch.
+          CGO_CFLAGS: ${{ matrix.goos == 'darwin' && format('-arch {0}', matrix.goarch == 'amd64' && 'x86_64' || 'arm64') || '' }}
+          CGO_LDFLAGS: ${{ matrix.goos == 'darwin' && format('-arch {0}', matrix.goarch == 'amd64' && 'x86_64' || 'arm64') || '' }}
+        run: go build ${{ matrix.flags }} -o "${{ matrix.binary }}" .
+
+      - name: Crea il pacchetto
+        shell: bash
+        run: |
+          pkg="AriaCastClient-${{ matrix.name }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            7z a "$pkg.zip" "${{ matrix.binary }}"
+          else
+            chmod +x "${{ matrix.binary }}"
+            tar -czf "$pkg.tar.gz" "${{ matrix.binary }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pacchetto-${{ matrix.name }}
+          path: |
+            AriaCastClient-${{ matrix.name }}.zip
+            AriaCastClient-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Pubblica la release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pacchetto-*
+          path: dist
+          merge-multiple: true
+
+      # Solo a compilazione riuscita su tutte le piattaforme.
+      - name: Crea la release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          target_commitish: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          name: Build ${{ github.run_number }}
+          body: |
+            Compilazione automatica ${{ github.event.pull_request.title && format('della PR #{0}: {1}', github.event.pull_request.number, github.event.pull_request.title) || 'manuale' }}.
+            Commit: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          make_latest: true
+
+      # Così, se una compilazione fallisce, l'ultima release buona resta disponibile.
+      - name: Cancella le release precedenti
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const current = `build-${context.runNumber}`;
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            for (const r of releases) {
+              if (!r.tag_name.startsWith('build-') || r.tag_name === current) continue;
+              core.info(`Cancello la release ${r.tag_name}`);
+              try {
+                await github.rest.repos.deleteRelease({ owner, repo, release_id: r.id });
+                await github.rest.git.deleteRef({ owner, repo, ref: `tags/${r.tag_name}` });
+              } catch (e) { core.warning(`${r.tag_name}: ${e.message}`); }
+            }
